@@ -126,6 +126,7 @@ int main(int argc, char** argv) {
     if (!sound_roms.empty()) {
         dcs = std::make_unique<ki::Dcs>(ki::read_sound_roms_or_die(sound_roms));
         board.dcs = dcs.get();
+        if (const char* t = std::getenv("KI_DCS_THREAD"); t && std::string(t) == "1") dcs->start_thread();
     }
     if (cold) board.set_cycles_to_vblank(0);  // MAME's screen starts a VBLANK at time 0 (every frame since)
     else if (entry != 0x88000000u) board.set_logical_geometry(14, 40);  // set by the boot code (IDE command 0x91)
@@ -276,6 +277,7 @@ int main(int argc, char** argv) {
             if (s8 - 0x88000000u < ki::kDramSize - 16)
                 for (int i = 0; i < 16; ++i) std::printf(" %02x", ctx.dram[s8 - 0x88000000u + i]);
             if (dcs) {
+                dcs->stop_thread();
                 std::printf("\nDCS: %zu samples at %.1f Hz, %llu DSP cycles", dcs->samples().size(), dcs->sample_rate(),
                             static_cast<unsigned long long>(dcs->cycles()));
                 if (!wav_path.empty())

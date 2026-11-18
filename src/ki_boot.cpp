@@ -136,7 +136,10 @@ void SaveState::on_entry(Context& c, uint32_t entry) {
     s.ctx_ = c;
     s.entry_ = entry;
     s.board_.emplace(*s.live_board_);
-    if (s.live_dcs_) s.dcs_->copy_state_from(*s.live_dcs_);
+    if (s.live_dcs_) {
+        s.live_dcs_->park();
+        s.dcs_->copy_state_from(*s.live_dcs_);
+    }
     s.valid_ = true;
     s.requested_ = false;
     s.just_saved_ = true;
@@ -157,7 +160,10 @@ uint32_t SaveState::restore(Context& c) {
     c.tail_fn = nullptr;
     c.depth = 0;
     *live_board_ = *board_;
-    if (live_dcs_) live_dcs_->copy_state_from(*dcs_);
+    if (live_dcs_) {
+        live_dcs_->park();
+        live_dcs_->copy_state_from(*dcs_);
+    }
     schedule(c);
     return entry_;
 }

@@ -11,8 +11,12 @@
 #pragma once
 
 #include <array>
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 #include "adsp2105.h"
@@ -25,19 +29,35 @@ public:
 
     // roms: the eight sample ROMs in order u10, u11, u12, u13, u33, u34, u35, u36.
     explicit Dcs(const std::vector<std::vector<uint8_t>>& roms);
+    ~Dcs();
 
     // Host interface (kinst.cpp sound_reset_w / sound_control_w / sound_status_r).
     void reset_w(bool state);    // low holds the DSP in reset (and re-runs the board reset)
     void data_w(uint16_t data);  // a 16-bit command into the input latch, raises IRQ2
-    bool input_empty() const { return latch_control_ & kInputEmpty; }
+    bool input_empty() const { return latch_control_.load(std::memory_order_acquire) & kInputEmpty; }
 
     // Runs the DSP up to `dsp_cycles` (10 MHz cycles since power-on).
     void run_until(uint64_t dsp_cycles);
     uint64_t cycles() const { return dsp_.total_cycles(); }
+
+    // Scheduling as the host CPU sees it. Without a thread these run the DSP
+    // in place. With start_thread() the DSP runs on its own thread, behind the
+    // host, and the host waits only where it must see the DSP's state; the DSP
+    // still reaches exactly the same cycle before every host access, so the
+    // output is the same sample for sample.
+    void start_thread();
+    void stop_thread();                     // parks the DSP and joins the thread
+    bool threaded() const { return worker_.joinable(); }
+    void advance(uint64_t dsp_cycles);      // the DSP may run up to here
+    void sync(uint64_t dsp_cycles);         // on return the DSP is at dsp_cycles and idle
+    void park();                            // waits until the DSP has done all it was allowed to
+    bool input_empty_at(uint64_t dsp_cycles);  // input latch state at that cycle (sound status read)
+    // Moves the samples produced so far to the end of `out` (safe while threaded).
+    void take_samples(std::vector<int16_t>& out);
     uint32_t dsp_pc() const { return dsp_.pc(); }
 
     // DAC output: samples produced so far (16-bit signed, mono, silence while the
-    // DAC is off, so the timeline starts at power-on) and their rate.
+    // DAC is off, so the timeline starts at power-on) and their rate. Not while threaded.
     std::vector<int16_t>& samples() { return samples_; }
     double sample_rate() const { return sample_rate_; }
 
@@ -82,7 +102,8 @@ private:
     std::array<uint16_t, 0x20> control_regs_{};
     uint32_t bank_ = 0;
 
-    uint16_t latch_control_ = kInputEmpty | kOutputEmpty;
+    // Read by the host thread while the DSP thread runs (sound status).
+    std::atomic<uint16_t> latch_control_{kInputEmpty | kOutputEmpty};
     uint16_t input_data_ = 0, output_data_ = 0;
     uint16_t progflags_ = 0;
 
@@ -97,6 +118,16 @@ private:
     uint64_t dac_off_since_ = 0;  // DSP cycle since which the DAC has been off
     bool irq1_pending_clear_ = false;
     std::vector<int16_t> samples_;
+    std::mutex samples_mutex_;
+
+    // DSP thread: it runs the DSP toward goal_ and publishes its position in done_.
+    void worker_loop();
+    void wake_worker();
+    std::thread worker_;
+    std::atomic<uint64_t> goal_{0}, done_{0};
+    std::atomic<bool> stop_{false}, sleeping_{false};
+    std::mutex wake_mutex_;
+    std::condition_variable wake_cv_;
 
     // internal timer
     bool timer_enable_ = false, timer_ignore_ = false, timer_armed_ = false;

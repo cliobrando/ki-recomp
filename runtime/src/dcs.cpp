@@ -24,7 +24,7 @@ void Dcs::copy_state_from(const Dcs& o) {
     internal_dram_ = o.internal_dram_;
     control_regs_ = o.control_regs_;
     bank_ = o.bank_;
-    latch_control_ = o.latch_control_;
+    latch_control_.store(o.latch_control_.load());
     input_data_ = o.input_data_;
     output_data_ = o.output_data_;
     progflags_ = o.progflags_;
@@ -47,8 +47,117 @@ void Dcs::copy_state_from(const Dcs& o) {
     timer_start_cycles_ = o.timer_start_cycles_;
     timers_fired_ = o.timers_fired_;
     next_timer_ = o.next_timer_;
-    samples_.clear();
+    {
+        std::lock_guard<std::mutex> lock(samples_mutex_);
+        samples_.clear();
+    }
     dsp_.copy_state_from(o.dsp_);
+    // A restored state can be earlier than where the thread was (the DSP is parked here).
+    done_.store(cycles());
+    goal_.store(cycles());
+}
+
+Dcs::~Dcs() { stop_thread(); }
+
+// ---- DSP thread ------------------------------------------------------------------
+
+void Dcs::start_thread() {
+    if (threaded()) return;
+    stop_.store(false);
+    done_.store(cycles());
+    goal_.store(cycles());
+    worker_ = std::thread([this] { worker_loop(); });
+}
+
+void Dcs::stop_thread() {
+    if (!threaded()) return;
+    park();
+    stop_.store(true);
+    wake_worker();
+    worker_.join();
+}
+
+void Dcs::wake_worker() {
+    // Pairs with the worker's store of sleeping_ and its re-check of goal_ (both seq_cst).
+    if (sleeping_.load()) {
+        std::lock_guard<std::mutex> lock(wake_mutex_);
+        wake_cv_.notify_one();
+    }
+}
+
+void Dcs::worker_loop() {
+    // Short slices so that a host waiting in sync() sees the DSP's progress.
+    constexpr uint64_t kSlice = 2000;
+    for (;;) {
+        uint64_t goal = goal_.load(std::memory_order_acquire);
+        uint64_t now = dsp_.total_cycles();
+        if (now < goal) {
+            run_until(std::min(goal, now + kSlice));
+            done_.store(dsp_.total_cycles(), std::memory_order_release);
+            continue;
+        }
+        if (stop_.load()) return;
+        // Caught up: spin a little (the host usually lets it run again soon), then sleep.
+        bool more = false;
+        for (int i = 0; i < 4000 && !more; ++i) {
+            more = goal_.load(std::memory_order_acquire) > done_.load(std::memory_order_relaxed) || stop_.load();
+#if defined(__aarch64__) || defined(__arm__)
+            asm volatile("yield");
+#endif
+        }
+        if (more) continue;
+        std::unique_lock<std::mutex> lock(wake_mutex_);
+        sleeping_.store(true);
+        wake_cv_.wait(lock, [&] { return goal_.load() > done_.load() || stop_.load(); });
+        sleeping_.store(false);
+    }
+}
+
+void Dcs::advance(uint64_t target) {
+    if (!threaded()) {
+        if (target >= cycles() + 1000) run_until(target);
+        return;
+    }
+    if (target >= goal_.load(std::memory_order_relaxed) + 1000) {
+        goal_.store(target);
+        wake_worker();
+    }
+}
+
+void Dcs::sync(uint64_t target) {
+    if (!threaded()) {
+        run_until(target);
+        return;
+    }
+    if (target > goal_.load(std::memory_order_relaxed)) {
+        goal_.store(target);
+        wake_worker();
+    }
+    park();
+}
+
+void Dcs::park() {
+    if (!threaded()) return;
+    uint64_t goal = goal_.load();
+    while (done_.load(std::memory_order_acquire) < goal) {
+#if defined(__aarch64__) || defined(__arm__)
+        asm volatile("yield");
+#endif
+    }
+}
+
+bool Dcs::input_empty_at(uint64_t target) {
+    // Only the host fills the input latch, so once the DSP has emptied it, it
+    // stays empty until the host's next write: no need to wait for the DSP then.
+    if (threaded() && input_empty()) return true;
+    sync(target);
+    return input_empty();
+}
+
+void Dcs::take_samples(std::vector<int16_t>& out) {
+    std::lock_guard<std::mutex> lock(samples_mutex_);
+    out.insert(out.end(), samples_.begin(), samples_.end());
+    samples_.clear();
 }
 
 // ---- host interface ----------------------------------------------------------
@@ -268,13 +377,17 @@ void Dcs::stop_dac() {
 void Dcs::pad_silence(uint64_t sample_cycles) {
     // While the DAC is off MAME's stream outputs silence; keep the timeline continuous.
     uint64_t now = dsp_.total_cycles();
-    if (now > dac_off_since_) samples_.insert(samples_.end(), (now - dac_off_since_) / sample_cycles, 0);
+    if (now > dac_off_since_) {
+        std::lock_guard<std::mutex> lock(samples_mutex_);
+        samples_.insert(samples_.end(), (now - dac_off_since_) / sample_cycles, 0);
+    }
     dac_off_since_ = now;
 }
 
 void Dcs::transfer_half_buffer() {
     uint32_t reg = dsp_.ireg(ireg_);
     int count = static_cast<int>(size_ / (2u * static_cast<uint32_t>(incs_ ? incs_ : 1)));
+    std::lock_guard<std::mutex> lock(samples_mutex_);
     for (int i = 0; i < count; ++i) {
         samples_.push_back(static_cast<int16_t>(data_read(reg)));
         reg += static_cast<uint32_t>(incs_);

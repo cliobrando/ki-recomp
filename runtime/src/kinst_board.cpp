@@ -65,7 +65,7 @@ void KinstBoard::complete_pending() {
 
 void KinstBoard::update(Context& c) {
     now_ = c.cycles;
-    if (dcs && c.cycles / kCyclesPerDspCycle >= dcs->cycles() + 1000) dcs->run_until(c.cycles / kCyclesPerDspCycle);
+    if (dcs) dcs->advance(c.cycles / kCyclesPerDspCycle);
     if (pending_ != Pending::None && c.cycles >= busy_until_) complete_pending();
     while (c.cycles >= next_vblank_) {
         ++frame_;
@@ -133,8 +133,7 @@ uint32_t KinstBoard::reg32_read(Context& c, uint32_t a) {
         case 0x10000088: return p2;
         case 0x10000090:  // VOLUME: bit 1 = DCS input latch empty (active high), others released
             if (!dcs) return 0xffffffff;
-            dcs->run_until(c.cycles / kCyclesPerDspCycle);
-            return dcs->input_empty() ? 0xffffffff : 0xfffffffd;
+            return dcs->input_empty_at(c.cycles / kCyclesPerDspCycle) ? 0xffffffff : 0xfffffffd;
         case 0x10000098: return 0xffffffff;        // UNUSED
         case 0x100000a0: return dsw;
         case 0x10000170: return ide_read(8, false);  // CS1 reg 6: alternate status
@@ -165,7 +164,7 @@ void KinstBoard::reg32_write(Context& c, uint32_t a, uint32_t data, uint32_t mas
             combine(sound_reset_);
             ++stats.sound_writes;
             if (dcs) {
-                dcs->run_until(c.cycles / kCyclesPerDspCycle);
+                dcs->sync(c.cycles / kCyclesPerDspCycle);
                 dcs->reset_w(sound_reset_ & 1);
             }
             return;
@@ -174,7 +173,7 @@ void KinstBoard::reg32_write(Context& c, uint32_t a, uint32_t data, uint32_t mas
             combine(sound_control_);
             ++stats.sound_writes;
             if (dcs && !(prev & 2) && (sound_control_ & 2)) {
-                dcs->run_until(c.cycles / kCyclesPerDspCycle);
+                dcs->sync(c.cycles / kCyclesPerDspCycle);
                 dcs->data_w(static_cast<uint16_t>(sound_data_));
             }
             return;

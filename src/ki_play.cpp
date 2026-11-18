@@ -387,6 +387,9 @@ int main(int argc, char** argv) {
                 constexpr int kSide = 54;
                 if (wide && hd.sides(ctx, board.displayed_bank(), kSide, left, right)) {
                     for (int i = 0; i < 2; ++i) {
+        // The sound DSP on its own core (KI_DCS_THREAD=0: in line, as before).
+        const char* t = std::getenv("KI_DCS_THREAD");
+        if (!t || std::string(t) != "0") dcs->start_thread();
                         if (!side_tex[i]) {
                             side_tex[i] = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING,
                                                             kSide * ki::HdRenderer::kScale, ki::HdRenderer::kH);
@@ -527,7 +530,8 @@ int main(int argc, char** argv) {
         board.p2 = p2;
 
         if (dcs) {
-            std::vector<int16_t>& pcm = dcs->samples();
+            static std::vector<int16_t> pcm;
+            dcs->take_samples(pcm);
             // Drop audio in turbo mode, or if the queue backs up past 200 ms.
             if (audio && !turbo && SDL_GetQueuedAudioSize(audio) < 31250 * 2 / 5)
                 SDL_QueueAudio(audio, pcm.data(), static_cast<Uint32>(pcm.size() * sizeof(int16_t)));
