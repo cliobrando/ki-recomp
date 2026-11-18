@@ -83,20 +83,39 @@ void KinstBoard::update(Context& c) {
     }
 }
 
-std::vector<uint8_t> KinstBoard::framebuffer_rgb(const Context& c) const {
+std::vector<uint8_t> KinstBoard::framebuffer_rgb(const Context& c) const { return rgb_of(&c.sram[displayed_bank()]); }
+
+std::vector<uint8_t> KinstBoard::rgb_of(const uint8_t* fb) {
     std::vector<uint8_t> rgb(320 * 240 * 3);
-    uint32_t base = (vram_control_ & 4) ? 0x58000 : 0x30000;
-    for (int y = 0; y < 240; ++y)
-        for (int x = 0; x < 320; ++x) {
-            uint32_t a = base + (y * 320 + x) * 2;
-            uint16_t v = static_cast<uint16_t>(c.sram[a] | (c.sram[a + 1] << 8));
-            auto expand = [](unsigned v5) { return static_cast<uint8_t>((v5 << 3) | (v5 >> 2)); };
-            uint8_t* p = &rgb[(y * 320 + x) * 3];
-            p[0] = expand(v & 0x1f);          // BGR555: red in the low bits
-            p[1] = expand((v >> 5) & 0x1f);
-            p[2] = expand((v >> 10) & 0x1f);
-        }
+    for (int i = 0; i < 320 * 240; ++i) {
+        uint16_t v = static_cast<uint16_t>(fb[2 * i] | (fb[2 * i + 1] << 8));
+        auto expand = [](unsigned v5) { return static_cast<uint8_t>((v5 << 3) | (v5 >> 2)); };
+        uint8_t* p = &rgb[i * 3];
+        p[0] = expand(v & 0x1f);  // BGR555: red in the low bits
+        p[1] = expand((v >> 5) & 0x1f);
+        p[2] = expand((v >> 10) & 0x1f);
+    }
     return rgb;
+}
+
+void KinstBoard::framebuffer_argb(const Context& c, uint32_t* dst, int pitch) const {
+    argb_of(&c.sram[displayed_bank()], dst, pitch);
+}
+
+void KinstBoard::argb_of(const uint8_t* fb, uint32_t* dst, int pitch) {
+    // BGR555 -> ARGB8888 through a table (the same expansion as rgb_of).
+    static const std::vector<uint32_t> lut = [] {
+        std::vector<uint32_t> t(0x8000);
+        auto expand = [](unsigned v5) { return (v5 << 3) | (v5 >> 2); };
+        for (unsigned v = 0; v < 0x8000; ++v)
+            t[v] = 0xff000000u | expand(v & 0x1f) << 16 | expand((v >> 5) & 0x1f) << 8 | expand((v >> 10) & 0x1f);
+        return t;
+    }();
+    for (int y = 0; y < 240; ++y) {
+        uint32_t* row = reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(dst) + static_cast<size_t>(y) * pitch);
+        const uint8_t* s = fb + y * 640;
+        for (int x = 0; x < 320; ++x) row[x] = lut[(s[2 * x] | s[2 * x + 1] << 8) & 0x7fff];
+    }
 }
 
 // ---- I/O space ---------------------------------------------------------------

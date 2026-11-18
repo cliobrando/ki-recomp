@@ -1,6 +1,6 @@
 // Plays the recompiled Killer Instinct program in a window (SDL2).
 //
-// usage: ki_play [--data <dir>] [--scale N] [--mute] [--opponent NAMES] [--stage N,...]
+// usage: ki_play [--data <dir>] [--scale N] [--fullscreen] [--mute] [--opponent NAMES] [--stage N,...]
 //        ki_play --boot <snapshot dir|rom> --disk <kinst.img> --rom <ki-l15d.u98>
 //                [--sound-roms <dir>] [--scale N] [--mute]      (development)
 //
@@ -34,13 +34,17 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -149,6 +153,62 @@ std::vector<uint32_t> saved_lbas(const std::string& path) {
 
 }  // namespace
 
+// Runs the drawing jobs on a thread of their own, one at a time: the game goes
+// on with the next frame while the GPU work and the buffer swap of this one are
+// done. Until start() (or with KI_RENDER_THREAD=0) a job runs in place. Only
+// this thread uses the renderer once it is started.
+class RenderThread {
+public:
+    void start(SDL_Window* window) {
+        SDL_GL_MakeCurrent(window, nullptr);  // the renderer's context moves to the thread
+        thread_ = std::thread([this] { loop(); });
+    }
+    bool started() const { return thread_.joinable(); }
+    // Waits for the previous job, hands this one over; with wait, until it is done.
+    void run(std::function<void()> job, bool wait) {
+        if (!started()) {
+            job();
+            return;
+        }
+        std::unique_lock<std::mutex> lock(m_);
+        cv_.wait(lock, [&] { return !busy_; });
+        job_ = std::move(job);
+        busy_ = true;
+        cv_.notify_all();
+        if (wait) cv_.wait(lock, [&] { return !busy_; });
+    }
+    void stop() {
+        if (!started()) return;
+        {
+            std::unique_lock<std::mutex> lock(m_);
+            cv_.wait(lock, [&] { return !busy_; });
+            stop_ = true;
+            cv_.notify_all();
+        }
+        thread_.join();
+    }
+
+private:
+    void loop() {
+        std::unique_lock<std::mutex> lock(m_);
+        for (;;) {
+            cv_.wait(lock, [&] { return busy_ || stop_; });
+            if (!busy_) return;
+            std::function<void()> job = std::move(job_);
+            lock.unlock();
+            job();
+            lock.lock();
+            busy_ = false;
+            cv_.notify_all();
+        }
+    }
+    std::thread thread_;
+    std::mutex m_;
+    std::condition_variable cv_;
+    std::function<void()> job_;
+    bool busy_ = false, stop_ = false;
+};
+
 char** g_argv = nullptr;  // for the reset key
 
 int main(int argc, char** argv) {
@@ -158,9 +218,11 @@ int main(int argc, char** argv) {
     std::string aspect_arg;
     int scale = 3;
     bool mute = false;
+    bool fullscreen = false;  // --fullscreen, and always on KMS/DRM (no desktop: the window is the screen)
     for (int i = 1; i < argc; ++i) {
         std::string k = argv[i];
         if (k == "--mute") { mute = true; continue; }
+        if (k == "--fullscreen") { fullscreen = true; continue; }
         if (i + 1 >= argc) break;
         std::string v = argv[++i];
         if (k == "--boot") boot = v;
@@ -184,27 +246,56 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
         return 1;
     }
-    SDL_Window* window = SDL_CreateWindow(kTitle, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 320 * scale,
-                                          240 * scale, SDL_WINDOW_RESIZABLE);
+    // Fullscreen (and always on KMS/DRM, where the window is the screen): created at
+    // the screen's size from the start. A window made at another size and switched
+    // to fullscreen afterwards kept the old height in GL on KMS/DRM, which put the
+    // picture at the top of the screen instead of in the middle.
+    const char* video_driver = SDL_GetCurrentVideoDriver();
+    if (video_driver && std::string(video_driver) == "KMSDRM") fullscreen = true;
+    int win_w = 320 * scale, win_h = 240 * scale;
+    Uint32 win_flags = SDL_WINDOW_RESIZABLE;
+    SDL_DisplayMode desktop;
+    if (fullscreen && SDL_GetDesktopDisplayMode(0, &desktop) == 0) {
+        win_w = desktop.w;
+        win_h = desktop.h;
+        win_flags = SDL_WINDOW_FULLSCREEN_DESKTOP;
+    }
+    SDL_Window* window =
+        SDL_CreateWindow(kTitle, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, win_w, win_h, win_flags);
     SDL_Renderer* renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
     // 16:9: the 4:3 picture in the middle of a 427x240 view; the sides show a
     // blurred, darkened copy of the picture ("ambient"). V switches, remembered.
     bool wide = read_text(pref_path() + "aspect.txt") == "16:9";
     if (!aspect_arg.empty()) wide = aspect_arg == "16:9";
+    RenderThread render;
     auto set_aspect = [&](bool w) {
         wide = w;
-        SDL_RenderSetLogicalSize(renderer, wide ? kWideW : 320, 240);
-        int ww = 0, wh = 0;
-        SDL_GetWindowSize(window, &ww, &wh);
-        if (!(SDL_GetWindowFlags(window) & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_MAXIMIZED)))
-            SDL_SetWindowSize(window, wh * (wide ? kWideW : 320) / 240, wh);
+        render.run([&] {
+            SDL_RenderSetLogicalSize(renderer, wide ? kWideW : 320, 240);
+            int ww = 0, wh = 0;
+            SDL_GetWindowSize(window, &ww, &wh);
+            if (!(SDL_GetWindowFlags(window) & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_MAXIMIZED)))
+                SDL_SetWindowSize(window, wh * (wide ? kWideW : 320) / 240, wh);
+        }, true);
         write_text(pref_path() + "aspect.txt", wide ? "16:9" : "4:3");
     };
     set_aspect(wide);
+    if (std::getenv("KI_STATS")) {
+        int ww = 0, wh = 0;
+        SDL_GetRendererOutputSize(renderer, &ww, &wh);
+        SDL_Rect vp;
+        SDL_RenderGetViewport(renderer, &vp);
+        float sx = 1, sy = 1;
+        SDL_RenderGetScale(renderer, &sx, &sy);
+        std::fprintf(stderr, "video: %s, output %dx%d, picture at %d,%d size %dx%d\n", video_driver ? video_driver : "?", ww,
+                     wh, static_cast<int>(vp.x * sx), static_cast<int>(vp.y * sy), static_cast<int>(vp.w * sx),
+                     static_cast<int>(vp.h * sy));
+    }
     SDL_Texture* ambient = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGB24, SDL_TEXTUREACCESS_STREAMING, 40, 30);
     SDL_SetTextureScaleMode(ambient, SDL_ScaleModeLinear);
+    // ARGB8888: a format the renderers take as is (RGB24 made SDL convert every frame).
     SDL_Texture* texture =
-        SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGB24, SDL_TEXTUREACCESS_STREAMING, 320, 240);
+        SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, 320, 240);
     SDL_Texture* hd_texture = nullptr;  // 4x picture when an HD pack is loaded (H toggles)
 
     // ---- the game's files ----
@@ -296,6 +387,9 @@ int main(int argc, char** argv) {
     if (!sound.empty()) {
         dcs = std::make_unique<ki::Dcs>(sound);
         board.dcs = dcs.get();
+        // The sound DSP on its own core (KI_DCS_THREAD=0: in line, as before).
+        const char* t = std::getenv("KI_DCS_THREAD");
+        if (!t || std::string(t) != "0") dcs->start_thread();
         if (!mute) {
             // KI's DCS program drives the DAC at 31250 Hz; SDL converts to the device rate.
             SDL_AudioSpec want{};
@@ -342,10 +436,14 @@ int main(int argc, char** argv) {
     // Controller bindings: G opens the setup screen (game paused meanwhile).
     static std::vector<ki::pad::Action> pad_actions = ki::pad::load_bindings(pref_path() + "pad_map.txt");
     static ki::pad::SetupScreen pad_setup(pad_actions, pref_path() + "pad_map.txt");
-    auto present = [&](ki::Context& ctx) {
+    std::atomic<double> swap_ms{0};  // KI_STATS: time inside SDL_RenderPresent (render thread)
+    // Draws the frame, from the live game state (ctx) or from a copy of the
+    // displayed framebuffer (fb, on the render thread while the game runs on).
+    auto draw = [&](const ki::Context* ctx, const uint8_t* fb, bool wide) {
         SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
         SDL_RenderClear(renderer);
-        auto rgb = board.framebuffer_rgb(ctx);
+        std::vector<uint8_t> rgb;
+        if (wide) rgb = fb ? ki::KinstBoard::rgb_of(fb) : board.framebuffer_rgb(*ctx);  // for the ambient sides
         const SDL_FRect game{wide ? (kWideW - 320) / 2.0f : 0.0f, 0.0f, 320.0f, 240.0f};
         if (wide) {
             // Ambient sides: the picture averaged down to 40x30, stretched over the
@@ -377,19 +475,16 @@ int main(int argc, char** argv) {
         }
 #ifdef KI_HAVE_HD
         // The HD copy is kept up to date even when not shown, so H switches instantly.
-        if (hd_texture) {
-            const std::vector<uint32_t>& px = hd.frame(ctx, board.displayed_bank());
+        if (hd_texture && ctx) {
+            const std::vector<uint32_t>& px = hd.frame(*ctx, board.displayed_bank());
             if (hd_on) {
                 // 16:9 on stages drawn from a wide panorama: the real sky and
                 // buildings beyond the picture's edges, over the ambient fill.
                 static std::vector<uint32_t> left, right;
                 static SDL_Texture* side_tex[2] = {};
                 constexpr int kSide = 54;
-                if (wide && hd.sides(ctx, board.displayed_bank(), kSide, left, right)) {
+                if (wide && hd.sides(*ctx, board.displayed_bank(), kSide, left, right)) {
                     for (int i = 0; i < 2; ++i) {
-        // The sound DSP on its own core (KI_DCS_THREAD=0: in line, as before).
-        const char* t = std::getenv("KI_DCS_THREAD");
-        if (!t || std::string(t) != "0") dcs->start_thread();
                         if (!side_tex[i]) {
                             side_tex[i] = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING,
                                                             kSide * ki::HdRenderer::kScale, ki::HdRenderer::kH);
@@ -405,18 +500,61 @@ int main(int argc, char** argv) {
                 SDL_RenderCopyF(renderer, hd_texture, nullptr, &game);
             }
         }
-        if (!hd_on)
+        if (!hd_on || !ctx)
 #endif
         {
-            SDL_UpdateTexture(texture, nullptr, rgb.data(), 320 * 3);
+            void* pixels;
+            int pitch;
+            if (SDL_LockTexture(texture, nullptr, &pixels, &pitch) == 0) {
+                if (fb) ki::KinstBoard::argb_of(fb, static_cast<uint32_t*>(pixels), pitch);
+                else board.framebuffer_argb(*ctx, static_cast<uint32_t*>(pixels), pitch);
+                SDL_UnlockTexture(texture);
+            }
             SDL_RenderCopyF(renderer, texture, nullptr, &game);
         }
         // The setup screen is laid out for the 4:3 area.
-        SDL_Rect area{static_cast<int>(game.x), 0, 320, 240};
+        // Restore the viewport afterwards rather than reset it: with a logical size,
+        // SDL_RenderSetViewport(nullptr) makes it the whole window, which drops the
+        // letterbox offset and drew every later frame at the top of a non-4:3 screen.
+        SDL_Rect saved;
+        SDL_RenderGetViewport(renderer, &saved);
+        SDL_Rect area{saved.x + static_cast<int>(game.x), saved.y, 320, 240};  // inside the letterbox
         SDL_RenderSetViewport(renderer, &area);
-        pad_setup.draw(renderer, pads);
-        SDL_RenderSetViewport(renderer, nullptr);
+        if (ctx) pad_setup.draw(renderer, pads);  // the setup screen is drawn in place (see present)
+        SDL_RenderSetViewport(renderer, &saved);
+        // KI_SHOT=N: the whole drawn screen of every N-th presented frame to screen_<frame>.ppm (diagnostics).
+        static const long shot_at = std::getenv("KI_SHOT") ? std::atol(std::getenv("KI_SHOT")) : -1;
+        static long presented = 0;
+        if (shot_at > 0 && ++presented % shot_at == 0) {
+            int lw = 0, lh = 0, ow = 0, oh = 0;
+            SDL_RenderGetLogicalSize(renderer, &lw, &lh);
+            SDL_RenderSetLogicalSize(renderer, 0, 0);
+            SDL_GetRendererOutputSize(renderer, &ow, &oh);
+            std::vector<uint8_t> px(static_cast<size_t>(ow) * oh * 3);
+            if (SDL_RenderReadPixels(renderer, nullptr, SDL_PIXELFORMAT_RGB24, px.data(), ow * 3) == 0)
+                write_ppm_file(pref_path() + "screen_" + std::to_string(presented) + ".ppm", px, ow, oh);
+            SDL_RenderSetLogicalSize(renderer, lw, lh);
+        }
+        auto ts = std::chrono::steady_clock::now();
         SDL_RenderPresent(renderer);
+        swap_ms = swap_ms + std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ts).count();
+    };
+    // In the common case the render thread draws a copy of the frame (two copies
+    // in turn: the one being drawn stays untouched). Paused, with the setup screen
+    // or with HD the drawing reads live state, so the game waits for it.
+    static std::vector<uint8_t> fb_copy[2] = {std::vector<uint8_t>(ki::KinstBoard::kFramebufferBytes),
+                                              std::vector<uint8_t>(ki::KinstBoard::kFramebufferBytes)};
+    static int fb_next = 0;
+    auto present = [&](ki::Context& ctx) {
+        bool live = paused || pad_setup.open() || hd_texture != nullptr;
+        if (live || !render.started()) {
+            render.run([&] { draw(&ctx, nullptr, wide); }, true);
+            return;
+        }
+        uint8_t* fb = fb_copy[fb_next].data();
+        fb_next ^= 1;
+        std::memcpy(fb, &ctx.sram[board.displayed_bank()], ki::KinstBoard::kFramebufferBytes);
+        render.run([&draw, fb, w = wide] { draw(nullptr, fb, w); }, false);
     };
     board.on_vblank = [&](ki::Context& ctx, uint64_t frame) {
         SDL_Event ev;
@@ -438,6 +576,7 @@ int main(int argc, char** argv) {
                 }
                 if (ev.type == SDL_QUIT || (ev.type == SDL_KEYDOWN && ev.key.keysym.scancode == SDL_SCANCODE_ESCAPE)) {
                     save();
+                    render.stop();
                     SDL_Quit();
                     std::exit(0);
                 }
@@ -478,6 +617,7 @@ int main(int argc, char** argv) {
                     // Reset: like switching the board off and on (same arguments).
                     save();
                     if (audio) SDL_CloseAudioDevice(audio);
+                    render.stop();
                     SDL_Quit();
                     execv(g_argv[0], g_argv);
                     std::perror("reset");
@@ -528,6 +668,20 @@ int main(int argc, char** argv) {
             if (pad && SDL_GameControllerGetAttached(pad) && player < 2) (player++ == 0 ? p1 : p2) &= ~ki::pad::pressed(pad, pad_actions);
         board.p1 = p1;
         board.p2 = p2;
+        // Quit on handhelds without a keyboard: Select (Back) + Start held for half a
+        // second on any pad, handled like the window's close button (high scores saved).
+        static int quit_hold = 0;
+        bool combo = false;
+        for (SDL_GameController* pad : pads)
+            if (pad && SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_BACK) &&
+                SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_START))
+                combo = true;
+        quit_hold = combo ? quit_hold + 1 : 0;
+        if (quit_hold == 30) {
+            SDL_Event quit{};
+            quit.type = SDL_QUIT;
+            SDL_PushEvent(&quit);
+        }
 
         if (dcs) {
             static std::vector<int16_t> pcm;
@@ -537,7 +691,27 @@ int main(int argc, char** argv) {
                 SDL_QueueAudio(audio, pcm.data(), static_cast<Uint32>(pcm.size() * sizeof(int16_t)));
             pcm.clear();
         }
+        // KI_STATS=1: once a second, where the time goes (game code, drawing, waiting).
+        static const bool stats = std::getenv("KI_STATS") != nullptr;
+        static auto last = std::chrono::steady_clock::now(), sec_start = last;
+        static double t_game = 0, t_present = 0, t_wait = 0;
+        static int n_frames = 0;
+        auto t0 = std::chrono::steady_clock::now();
+        if (stats) t_game += std::chrono::duration<double, std::milli>(t0 - last).count();
         if (!turbo || frame % 8 == 0) present(ctx);
+        auto t1 = std::chrono::steady_clock::now();
+        if (stats) {
+            t_present += std::chrono::duration<double, std::milli>(t1 - t0).count();
+            if (++n_frames, t1 - sec_start >= std::chrono::seconds(1)) {
+                double secs = std::chrono::duration<double>(t1 - sec_start).count();
+                std::fprintf(stderr, "stats: %.1f fps  game %.1f  present %.1f (swap %.1f)  wait %.1f ms/frame\n",
+                             n_frames / secs, t_game / n_frames, t_present / n_frames, swap_ms.load() / n_frames, t_wait / n_frames);
+                swap_ms = 0;
+                t_game = t_present = t_wait = 0;
+                n_frames = 0;
+                sec_start = t1;
+            }
+        }
         if (!turbo) {
             next_frame += std::chrono::duration_cast<std::chrono::steady_clock::duration>(
                 std::chrono::duration<double>(kFrameSeconds));
@@ -548,7 +722,10 @@ int main(int argc, char** argv) {
             if (next_frame > now) std::this_thread::sleep_until(next_frame);
             else if (now - next_frame > std::chrono::milliseconds(100)) next_frame = now;  // fell behind: resync
         }
+        last = std::chrono::steady_clock::now();
+        if (stats) t_wait += std::chrono::duration<double, std::milli>(last - t1).count();
     };
+    if (const char* t = std::getenv("KI_RENDER_THREAD"); !t || std::string(t) != "0") render.start(window);
     ki::schedule(c);
     bool ok = false;
     for (;;) {
@@ -562,6 +739,7 @@ int main(int argc, char** argv) {
             SDL_SetWindowTitle(window, "Killer Instinct (recompiled): state loaded");
         }
     }
+    render.stop();
     save();
     if (!ok)
         SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, kTitle,

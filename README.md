@@ -223,6 +223,7 @@ rebind any input; bindings are saved in `pad_map.txt` in the preferences folder)
 | A / B / RT | low attack: quick, medium, fierce |
 | Start (Nimbus: Menu) | start |
 | Back or LB | coin (LB for pads without Back, like the SteelSeries Nimbus) |
+| Back + Start (hold) | quit, like closing the window (for handhelds without a keyboard) |
 
 **Other keys**
 

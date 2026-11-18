@@ -42,6 +42,14 @@ public:
     std::function<void(Context&, uint64_t frame)> on_vblank;
     // Displayed framebuffer as RGB888, 320 x 240 (MAME screen_update).
     std::vector<uint8_t> framebuffer_rgb(const Context& c) const;
+    // The same picture as 32-bit ARGB (0xffRRGGBB) into dst, `pitch` bytes per row:
+    // one pass, for streaming straight into a texture.
+    void framebuffer_argb(const Context& c, uint32_t* dst, int pitch) const;
+    // The same conversions from a copy of the displayed framebuffer (kFramebufferBytes
+    // from displayed_bank()), for drawing on another thread while the game runs on.
+    static constexpr size_t kFramebufferBytes = 320 * 240 * 2;
+    static std::vector<uint8_t> rgb_of(const uint8_t* fb);
+    static void argb_of(const uint8_t* fb, uint32_t* dst, int pitch);
     // SRAM offset of the framebuffer being displayed (0x30000 or 0x58000).
     uint32_t displayed_bank() const { return (vram_control_ & 4) ? 0x58000 : 0x30000; }
 
