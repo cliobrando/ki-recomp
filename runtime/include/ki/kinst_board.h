@@ -29,6 +29,7 @@ public:
     uint64_t read(Context& c, uint32_t phys, int size) override;
     void write(Context& c, uint32_t phys, int size, uint64_t value) override;
     uint32_t interrupt_lines(Context& c) override;
+    uint64_t lines_stable_until(Context& c, uint64_t from, uint32_t mask) override;
     // For starts from a mid-game snapshot: cycles from cycle 0 to the next VBLANK start.
     void set_cycles_to_vblank(uint64_t cycles);
     // For starts from a mid-game snapshot: the logical CHS geometry the game set at

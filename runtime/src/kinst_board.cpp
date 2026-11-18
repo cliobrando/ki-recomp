@@ -29,6 +29,15 @@ uint32_t KinstBoard::interrupt_lines(Context& c) {
     return lines;
 }
 
+uint64_t KinstBoard::lines_stable_until(Context&, uint64_t from, uint32_t mask) {
+    // Int1 (IDE) changes only on I/O accesses and in update(); Int0 (VBLANK)
+    // only with the beam: at the start of line 240 and at the end of the frame.
+    if (mask & ~0xc00u) return from;
+    if (!(mask & 0x400)) return ~0ull;
+    uint64_t pos = (from + phase_) % kCyclesPerFrame;
+    return from + (pos >= kVblankStart ? kCyclesPerFrame - pos : kVblankStart - pos);
+}
+
 void KinstBoard::set_cycles_to_vblank(uint64_t cycles) {
     cycles %= kCyclesPerFrame;
     phase_ = (kVblankStart + kCyclesPerFrame - cycles) % kCyclesPerFrame;  // frame position at cycle 0

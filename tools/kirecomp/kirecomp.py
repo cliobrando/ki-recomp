@@ -473,6 +473,40 @@ class Translator:
             return f"func_{target:08x}(c); ki::drain(c);"
         return f"ki::call_indirect(c, {u32(target)}, {u32(pc)});"
 
+    def cause_wait(self, insns: list, idx: int) -> str | None:
+        """A loop that only waits for a board interrupt line:
+            L: mfc0 rX, Cause; [nop]; andi rX, rX, MASK; beq/bne rX, $zero, L
+               (delay slot: nop, or addiu rY, rY, imm counting the turns)
+        Its turns differ only in the cycle count (and the counter), so at L the
+        runtime may take the turns that cannot see a change in one step
+        (ki::skip_cause_wait); the result is the same as running them."""
+        i = insns[idx]
+        if i.name != "mfc0" or i.rd != COP0_CAUSE:
+            return None
+        r, body, k = i.rt, [i], idx + 1
+        while k < len(insns) and insns[k].name == "nop":
+            body.append(insns[k])
+            k += 1
+        if k + 2 >= len(insns):
+            return None
+        a, b, d = insns[k], insns[k + 1], insns[k + 2]
+        body += [a, b, d]
+        if any(body[j].vaddr != i.vaddr + 4 * j for j in range(len(body))):
+            return None
+        if r == 0 or a.name != "andi" or a.rs != r or a.rt != r or not a.imm or a.imm & ~0x7C00:
+            return None  # only board lines (Int0-Int4) in Cause
+        if b.name not in ("beq", "bne") or b.rs != r or b.rt != 0 or b.branch_target != i.vaddr:
+            return None
+        if d.name == "nop":
+            counter = "nullptr, 0"
+        elif d.name == "addiu" and d.rs == d.rt and d.rt not in (0, r):
+            counter = f"&c.r[{d.rt}], {d.simm}"
+        else:
+            return None
+        turn = sum(cycles_of(x) for x in body)
+        stay = "true" if b.name == "bne" else "false"
+        return f"ki::skip_cause_wait(c, 0x{a.imm:x}u, {stay}, {turn}, {counter});  // wait loop on Cause"
+
     def translate(self, fn: Function) -> str:
         insns = fn.insns
         if not insns:
@@ -589,6 +623,9 @@ class Translator:
             i = insns[idx]
             if i.vaddr in targets:
                 label(f"L_{i.vaddr:08x}")
+                wait = self.cause_wait(insns, idx) if self.timing else None
+                if wait:
+                    emit(wait)
             if not has_delay_slot(i):
                 if self.timing and i.name in ("mfc0", "dmfc0", "mtc0", "dmtc0") and i.rd in (
                         COP0_COUNT, COP0_COMPARE, COP0_STATUS):

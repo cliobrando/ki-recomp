@@ -41,6 +41,10 @@ struct IoHandler {
     virtual void write(Context& ctx, uint32_t phys, int size, uint64_t value) = 0;
     // Cause.IP bits (mask 0x7c00 for Int0..Int4) driven by the board at ctx.cycles.
     virtual uint32_t interrupt_lines(Context&) { return 0; }
+    // First cycle >= `from` at which interrupt_lines() & mask can differ from its
+    // value at `from`, as long as no I/O access or update() happens in between
+    // (wait loops use it to skip ahead exactly). `from` = no promise.
+    virtual uint64_t lines_stable_until(Context&, uint64_t from, uint32_t) { return from; }
     // Cycle count at which the board next needs attention (line changes, frames).
     virtual uint64_t next_event(Context&) { return ~0ull; }
     // Called from safe points once ctx.cycles reaches next_event().
@@ -318,6 +322,12 @@ inline void poll(Context& c, uint32_t pc) {
     if (c.cycles >= c.next_event) service(c, pc);
 }
 void schedule(Context& c);  // recompute next_event after state changes
+// At the head of a translated wait loop on board lines in Cause (see kirecomp
+// cause_wait): `turn` cycles per turn, the loop goes on while (Cause & mask) is
+// nonzero (stay) or zero (!stay), and *counter (if any) adds `step` per turn.
+// Takes in one step the turns that would see no change: same line value, no
+// event due at the safe point. KI_IDLE_SKIP=0 turns it off (A/B).
+void skip_cause_wait(Context& c, uint32_t mask, bool stay, unsigned turn, uint64_t* counter, int32_t step);
 void eret(Context& c);
 
 uint64_t mfc0(Context& c, unsigned reg, uint32_t pc);

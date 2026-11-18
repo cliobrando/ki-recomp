@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <string>
 
 namespace ki {
 
@@ -266,6 +268,23 @@ void service(Context& c, uint32_t pc) {
     uint32_t pending = cause_now(c) & sr & 0xff00u;
     if ((sr & 1) && !(sr & 6) && pending) take_interrupt(c, pc);
     schedule(c);
+}
+
+void skip_cause_wait(Context& c, uint32_t mask, bool stay, unsigned turn, uint64_t* counter, int32_t step) {
+    static const bool on = [] {
+        const char* v = std::getenv("KI_IDLE_SKIP");
+        return !v || std::string(v) != "0";
+    }();
+    if (!on || !c.io || c.trace_fn || !turn) return;
+    uint64_t t = c.cycles;
+    if (((c.io->interrupt_lines(c) & mask) != 0) != stay) return;  // this turn leaves the loop
+    uint64_t edge = c.io->lines_stable_until(c, t, mask);
+    if (edge <= t || c.next_event <= t + turn) return;
+    uint64_t by_line = (edge - 1 - t) / turn + 1;           // turns that read before the line changes
+    uint64_t by_event = (c.next_event - 1 - t) / turn;      // turns whose safe point has nothing to do
+    uint64_t n = by_line < by_event ? by_line : by_event;
+    c.cycles += static_cast<uint64_t>(turn) * n;
+    if (counter) *counter = sx32(lo32(*counter) + static_cast<uint32_t>(step) * static_cast<uint32_t>(n));
 }
 
 void eret(Context& c) {
